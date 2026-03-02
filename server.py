@@ -13,10 +13,17 @@ import pathlib
 import platform
 import plistlib
 import re
+import shutil
 import signal
 import socket
+import subprocess
 import sys
+import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 
 import matplotlib
 matplotlib.use("Agg")
@@ -35,6 +42,81 @@ try:
     GPU_AVAILABLE = True
 except ImportError:
     GPU_AVAILABLE = False
+
+
+# ── Reminder storage ──────────────────────────────────────────────────────────
+
+_REMINDER_LOCK = threading.Lock()
+_REMINDER_FILE = pathlib.Path.home() / ".syscontrol" / "reminders.json"
+
+
+def _load_reminders() -> list:
+    """Load reminders from disk. Creates file if missing. Must be called under _REMINDER_LOCK."""
+    _REMINDER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not _REMINDER_FILE.exists():
+        return []
+    try:
+        return json.loads(_REMINDER_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_reminders(reminders: list) -> None:
+    """Write reminders to disk. Must be called under _REMINDER_LOCK."""
+    _REMINDER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _REMINDER_FILE.write_text(json.dumps(reminders, indent=2))
+
+
+class ReminderChecker:
+    """Background daemon thread that fires due reminders via macOS notifications."""
+
+    def __init__(self):
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="syscontrol-reminders"
+        )
+
+    def start(self):
+        self._thread.start()
+
+    def _loop(self):
+        while True:
+            time.sleep(15)
+            self._check()
+
+    def _check(self):
+        now = datetime.datetime.now()
+        cutoff = now - datetime.timedelta(days=7)
+        with _REMINDER_LOCK:
+            reminders = _load_reminders()
+            changed = False
+            survivors = []
+            for r in reminders:
+                fire_at = datetime.datetime.fromisoformat(r["fire_at"])
+                if r["fired"]:
+                    # Prune fired reminders older than 7 days
+                    if fire_at >= cutoff:
+                        survivors.append(r)
+                    else:
+                        changed = True
+                    continue
+                if now >= fire_at:
+                    self._fire(r["message"])
+                    r["fired"] = True
+                    changed = True
+                survivors.append(r)
+            if changed:
+                _save_reminders(survivors)
+
+    @staticmethod
+    def _fire(message: str):
+        script = f'display notification {json.dumps(message)} with title "SysControl Reminder"'
+        try:
+            subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass  # Silently absorb — notification may be blocked by macOS privacy settings
 
 
 # ── MCP helpers ──────────────────────────────────────────────────────────────
@@ -869,6 +951,529 @@ def get_full_snapshot() -> dict:
     }
 
 
+# ── Agentic tool helpers ───────────────────────────────────────────────────────
+
+_RELATIVE_UNITS = {
+    "second": 1, "seconds": 1,
+    "minute": 60, "minutes": 60,
+    "hour": 3600, "hours": 3600,
+    "day": 86400, "days": 86400,
+    "week": 604800, "weeks": 604800,
+}
+
+
+def _parse_reminder_time(s: str):
+    """Parse natural-language time string into a datetime. Returns None on failure."""
+    s = s.strip().lower()
+    now = datetime.datetime.now()
+
+    # "in 2 hours 30 minutes" (compound)
+    m = re.match(r"in\s+(\d+)\s+hours?\s+(?:and\s+)?(\d+)\s+minutes?", s)
+    if m:
+        return now + datetime.timedelta(hours=int(m.group(1)), minutes=int(m.group(2)))
+
+    # "in 2 hours" / "in 30 minutes" / "in 1 day"
+    m = re.match(r"in\s+(\d+)\s+(\w+)", s)
+    if m:
+        unit = _RELATIVE_UNITS.get(m.group(2))
+        if unit:
+            return now + datetime.timedelta(seconds=int(m.group(1)) * unit)
+
+    # "tomorrow at 9:00 am" / "tomorrow at 3pm"
+    m = re.match(r"tomorrow\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", s)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2) or 0)
+        period = m.group(3)
+        if period == "pm" and hour < 12: hour += 12
+        if period == "am" and hour == 12: hour = 0
+        return (now + datetime.timedelta(days=1)).replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+
+    # "at 9:00 am" / "at 14:30" / "at 3pm"
+    m = re.match(r"at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", s)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2) or 0)
+        period = m.group(3)
+        if period == "pm" and hour < 12: hour += 12
+        if period == "am" and hour == 12: hour = 0
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += datetime.timedelta(days=1)
+        return target
+
+    return None
+
+
+def _human_timedelta(delta: datetime.timedelta) -> str:
+    secs = int(delta.total_seconds())
+    if secs < 0: return "overdue"
+    if secs < 60: return f"{secs} seconds"
+    if secs < 3600: return f"{secs // 60} minutes"
+    if secs < 86400: return f"{secs // 3600} hours {(secs % 3600) // 60} minutes"
+    return f"{secs // 86400} days"
+
+
+# ── Reminder tools ────────────────────────────────────────────────────────────
+
+def set_reminder(message: str, time_str: str) -> dict:
+    fire_at = _parse_reminder_time(time_str)
+    if fire_at is None:
+        return {
+            "success": False,
+            "error": (
+                f"Could not parse time '{time_str}'. "
+                "Try: 'in 2 hours', 'in 30 minutes', 'at 9:00 am', 'at 3pm', 'tomorrow at 8am'."
+            ),
+        }
+    reminder_id = uuid.uuid4().hex[:8]
+    entry = {
+        "id": reminder_id,
+        "message": message,
+        "fire_at": fire_at.isoformat(),
+        "created_at": datetime.datetime.now().isoformat(),
+        "fired": False,
+    }
+    with _REMINDER_LOCK:
+        reminders = _load_reminders()
+        reminders.append(entry)
+        _save_reminders(reminders)
+    return {
+        "success": True,
+        "id": reminder_id,
+        "message": message,
+        "fires_at": fire_at.strftime("%Y-%m-%d %I:%M %p"),
+        "fires_in": _human_timedelta(fire_at - datetime.datetime.now()),
+    }
+
+
+def list_reminders() -> dict:
+    with _REMINDER_LOCK:
+        reminders = _load_reminders()
+    now = datetime.datetime.now()
+    pending = [r for r in reminders if not r["fired"]]
+    return {
+        "count": len(pending),
+        "reminders": [
+            {
+                "id": r["id"],
+                "message": r["message"],
+                "fires_at": r["fire_at"],
+                "fires_in": _human_timedelta(
+                    datetime.datetime.fromisoformat(r["fire_at"]) - now
+                ),
+            }
+            for r in pending
+        ],
+    }
+
+
+def cancel_reminder(reminder_id: str) -> dict:
+    with _REMINDER_LOCK:
+        reminders = _load_reminders()
+        original_len = len(reminders)
+        reminders = [r for r in reminders if not (r["id"] == reminder_id and not r["fired"])]
+        if len(reminders) == original_len:
+            return {"success": False, "error": f"No active reminder with id '{reminder_id}'"}
+        _save_reminders(reminders)
+    return {"success": True, "cancelled_id": reminder_id}
+
+
+# ── Weather tool ──────────────────────────────────────────────────────────────
+
+_WMO_DESCRIPTIONS = {
+    0: "Clear sky",
+    1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+    45: "Fog", 48: "Freezing fog",
+    51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
+    56: "Freezing drizzle (light)", 57: "Freezing drizzle (heavy)",
+    61: "Light rain", 63: "Moderate rain", 65: "Heavy rain",
+    66: "Freezing rain (light)", 67: "Freezing rain (heavy)",
+    71: "Light snow", 73: "Moderate snow", 75: "Heavy snow",
+    77: "Snow grains",
+    80: "Light rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+    85: "Light snow showers", 86: "Heavy snow showers",
+    95: "Thunderstorm", 96: "Thunderstorm with hail", 99: "Thunderstorm with heavy hail",
+}
+
+_SNOW_CODES = {71, 73, 75, 77, 85, 86}
+_RAIN_CODES = {51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82}
+_FOG_CODES  = {45, 48}
+
+
+def _clothing_suggestions(temp_f: float, code: int, wind_mph: float, humidity_pct: float) -> list:
+    suggestions = []
+    if temp_f < 10:
+        suggestions.append("Extreme cold: insulated parka, thermal underlayers, insulated waterproof boots, face mask, and thick gloves")
+    elif temp_f < 25:
+        suggestions.append("Heavy winter coat, thermal underlayers, warm hat, insulated gloves, and winter boots")
+    elif temp_f < 40:
+        suggestions.append("Winter coat, warm sweater or fleece, gloves, and a hat")
+    elif temp_f < 55:
+        suggestions.append("Medium jacket or fleece and long pants")
+    elif temp_f < 68:
+        suggestions.append("Light jacket or cardigan and long pants or jeans")
+    elif temp_f < 80:
+        suggestions.append("T-shirt or light long-sleeve and comfortable pants or shorts")
+    else:
+        suggestions.append("Light, breathable clothing — stay hydrated")
+
+    if code in _SNOW_CODES:
+        suggestions.append("Snow expected: wear waterproof boots and a snow-resistant outer layer")
+    elif code in _RAIN_CODES:
+        suggestions.append("Rain expected: bring a rain jacket or umbrella and waterproof footwear")
+    elif code in _FOG_CODES:
+        suggestions.append("Foggy conditions: drive carefully and use low-beam headlights")
+
+    if wind_mph >= 25:
+        suggestions.append("Strong winds: a windproof outer layer is important")
+    elif wind_mph >= 15:
+        suggestions.append("Breezy: a windbreaker helps")
+
+    if temp_f >= 75 and humidity_pct >= 70:
+        suggestions.append("High humidity: moisture-wicking fabrics recommended")
+
+    return suggestions
+
+
+def get_weather(location: str = "", units: str = "imperial") -> dict:
+    units = units if units in ("imperial", "metric") else "imperial"
+    temp_unit  = "fahrenheit" if units == "imperial" else "celsius"
+    wind_unit  = "mph" if units == "imperial" else "kmh"
+    temp_symbol = "°F" if units == "imperial" else "°C"
+    speed_label = "mph" if units == "imperial" else "km/h"
+
+    try:
+        if location.strip():
+            # Geocode named location via Nominatim (OpenStreetMap)
+            encoded = urllib.parse.quote(location.strip())
+            url = f"https://nominatim.openstreetmap.org/search?q={encoded}&format=json&limit=1"
+            req = urllib.request.Request(url, headers={"User-Agent": "syscontrol-mcp/0.1"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                geo_data = json.loads(r.read().decode())
+            if not geo_data:
+                return {"error": f"Location '{location}' not found. Try a different city name."}
+            lat = float(geo_data[0]["lat"])
+            lon = float(geo_data[0]["lon"])
+            display = geo_data[0].get("display_name", location)
+            parts = [p.strip() for p in display.split(",")]
+            city_name = parts[0]
+            country = parts[-1] if len(parts) > 1 else ""
+            region = parts[1] if len(parts) > 2 else ""
+            location_source = "geocode"
+        else:
+            # Auto-detect from IP via ipinfo.io
+            with urllib.request.urlopen("https://ipinfo.io/json", timeout=8) as r:
+                ip_data = json.loads(r.read().decode())
+            loc_str = ip_data.get("loc", "0,0")
+            lat, lon = map(float, loc_str.split(","))
+            city_name = ip_data.get("city", "Unknown")
+            region = ip_data.get("region", "")
+            country = ip_data.get("country", "")
+            location_source = "ip_geolocation"
+
+        # Fetch weather from Open-Meteo (free, no API key)
+        params = (
+            f"latitude={lat}&longitude={lon}"
+            f"&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
+            f"precipitation,weathercode,windspeed_10m,is_day"
+            f"&temperature_unit={temp_unit}&wind_speed_unit={wind_unit}"
+            f"&precipitation_unit={'inch' if units == 'imperial' else 'mm'}"
+            f"&forecast_days=1"
+        )
+        weather_url = f"https://api.open-meteo.com/v1/forecast?{params}"
+        with urllib.request.urlopen(weather_url, timeout=10) as r:
+            weather_data = json.loads(r.read().decode())
+
+        current = weather_data["current"]
+        temp      = current["temperature_2m"]
+        feels_like = current["apparent_temperature"]
+        humidity  = current["relative_humidity_2m"]
+        wind      = current["windspeed_10m"]
+        precip    = current["precipitation"]
+        code      = current["weathercode"]
+        is_day    = bool(current["is_day"])
+
+        # Convert to °F for clothing logic when units=metric
+        temp_f   = temp if units == "imperial" else (temp * 9 / 5 + 32)
+        wind_mph = wind if units == "imperial" else wind * 0.621371
+        condition = _WMO_DESCRIPTIONS.get(code, f"Weather code {code}")
+        clothing  = _clothing_suggestions(temp_f, code, wind_mph, humidity)
+
+        return {
+            "location": {
+                "city": city_name,
+                "region": region,
+                "country": country,
+                "coordinates": {"lat": round(lat, 4), "lon": round(lon, 4)},
+                "source": location_source,
+            },
+            "current": {
+                "temperature":  {"value": round(temp, 1), "unit": temp_symbol},
+                "feels_like":   {"value": round(feels_like, 1), "unit": temp_symbol},
+                "humidity_percent": humidity,
+                "wind_speed":   {"value": round(wind, 1), "unit": speed_label},
+                "precipitation": {"value": round(precip, 2), "unit": "in" if units == "imperial" else "mm"},
+                "condition":    condition,
+                "condition_code": code,
+                "is_day": is_day,
+            },
+            "clothing_suggestions": clothing,
+        }
+    except urllib.error.URLError as e:
+        return {"error": f"Network error: {str(e)}. Check your internet connection."}
+    except (KeyError, ValueError, json.JSONDecodeError) as e:
+        return {"error": f"Failed to parse weather data: {str(e)}"}
+
+
+# ── App update checker ────────────────────────────────────────────────────────
+
+def check_app_updates() -> dict:
+    if platform.system() != "Darwin":
+        return {"error": "check_app_updates is currently macOS-only."}
+
+    results: dict = {
+        "brew_formulae": [],
+        "brew_casks": [],
+        "mac_app_store": [],
+        "system_updates": [],
+        "errors": [],
+        "summary": "",
+    }
+
+    # Homebrew
+    if shutil.which("brew"):
+        try:
+            proc = subprocess.run(
+                ["brew", "outdated", "--json=v2"],
+                capture_output=True, text=True, timeout=120,
+                env={**os.environ, "HOMEBREW_NO_AUTO_UPDATE": "1"},
+            )
+            if proc.returncode in (0, 1) and proc.stdout.strip():
+                data = json.loads(proc.stdout)
+                results["brew_formulae"] = [
+                    {
+                        "name": f["name"],
+                        "installed": f["installed_versions"][0] if f.get("installed_versions") else "?",
+                        "available": f.get("current_version", "?"),
+                    }
+                    for f in data.get("formulae", [])
+                ]
+                results["brew_casks"] = [
+                    {
+                        "name": c["name"],
+                        "installed": c.get("installed_versions", ["?"])[0],
+                        "available": c.get("current_version", "?"),
+                    }
+                    for c in data.get("casks", [])
+                ]
+            elif proc.returncode not in (0, 1):
+                results["errors"].append(f"brew error: {proc.stderr.strip()[:200]}")
+        except subprocess.TimeoutExpired:
+            results["errors"].append("brew outdated timed out (>120s)")
+        except (json.JSONDecodeError, OSError) as e:
+            results["errors"].append(f"brew parse error: {str(e)}")
+    else:
+        results["errors"].append("Homebrew not installed — install from https://brew.sh")
+
+    # Mac App Store (requires `mas` CLI)
+    if shutil.which("mas"):
+        try:
+            proc = subprocess.run(
+                ["mas", "outdated"],
+                capture_output=True, text=True, timeout=60,
+            )
+            for line in proc.stdout.splitlines():
+                m = re.match(r"(\d+)\s+(.+?)\s+\((.+?)\)", line.strip())
+                if m:
+                    results["mac_app_store"].append({
+                        "app_id": m.group(1),
+                        "name": m.group(2).strip(),
+                        "available_version": m.group(3),
+                    })
+        except subprocess.TimeoutExpired:
+            results["errors"].append("mas outdated timed out (>60s)")
+        except OSError as e:
+            results["errors"].append(f"mas error: {str(e)}")
+    else:
+        results["errors"].append(
+            "mas not installed — install with 'brew install mas' to check App Store updates"
+        )
+
+    # macOS system updates
+    if shutil.which("softwareupdate"):
+        try:
+            proc = subprocess.run(
+                ["softwareupdate", "-l"],
+                capture_output=True, text=True, timeout=60,
+            )
+            combined = proc.stdout + proc.stderr
+            current_label = None
+            for line in combined.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("* Label:"):
+                    current_label = stripped.split(":", 1)[1].strip()
+                elif current_label and "Title:" in stripped:
+                    m = re.search(r"Title:\s*(.+?),\s*Version:\s*([\d.]+)", stripped)
+                    if m:
+                        results["system_updates"].append({
+                            "label": current_label,
+                            "title": m.group(1).strip(),
+                            "version": m.group(2),
+                        })
+                    current_label = None
+        except subprocess.TimeoutExpired:
+            results["errors"].append("softwareupdate timed out (>60s)")
+        except OSError as e:
+            results["errors"].append(f"softwareupdate error: {str(e)}")
+
+    total = (
+        len(results["brew_formulae"]) + len(results["brew_casks"])
+        + len(results["mac_app_store"]) + len(results["system_updates"])
+    )
+    if total == 0:
+        results["summary"] = "All apps are up to date."
+    else:
+        parts = []
+        if results["brew_formulae"]:
+            n = len(results["brew_formulae"])
+            parts.append(f"{n} Homebrew formula{'e' if n != 1 else ''}")
+        if results["brew_casks"]:
+            n = len(results["brew_casks"])
+            parts.append(f"{n} Homebrew cask{'s' if n != 1 else ''}")
+        if results["mac_app_store"]:
+            n = len(results["mac_app_store"])
+            parts.append(f"{n} App Store app{'s' if n != 1 else ''}")
+        if results["system_updates"]:
+            n = len(results["system_updates"])
+            parts.append(f"{n} system update{'s' if n != 1 else ''}")
+        results["summary"] = f"{total} update{'s' if total != 1 else ''} available: " + ", ".join(parts)
+
+    return results
+
+
+# ── Package tracking ──────────────────────────────────────────────────────────
+
+def _detect_carrier(tn: str) -> str:
+    tn = re.sub(r"\s+", "", tn).upper()
+    if tn.startswith("TBA"):
+        return "amazon_logistics"
+    if re.match(r"^1Z[A-Z0-9]{16}$", tn):
+        return "ups"
+    if re.match(r"^(94|93|92|91|90)\d{18,20}$", tn):
+        return "usps"
+    if re.match(r"^[A-Z]{2}\d{9}[A-Z]{2}$", tn):
+        return "usps"
+    if re.match(r"^\d{20,22}$", tn):
+        return "usps"
+    if re.match(r"^\d{12}$", tn):
+        return "fedex"
+    if re.match(r"^\d{15}$", tn):
+        return "fedex"
+    if re.match(r"^\d{22}$", tn):
+        return "fedex"
+    if re.match(r"^\d{10,11}$", tn):
+        return "dhl"
+    if re.match(r"^(JD|GM)\d{14,20}$", tn):
+        return "dhl"
+    return "unknown"
+
+
+_17TRACK_STATUS_MAP = {
+    10: "Not found / No information",
+    20: "In transit",
+    30: "Out for delivery",
+    40: "Delivered",
+    50: "Exception / Alert",
+}
+
+_17TRACK_CARRIER_NAMES = {
+    100001: "UPS", 100002: "USPS", 100003: "FedEx",
+    100004: "DHL", 100007: "Amazon Logistics", 100008: "DHL Express",
+    100010: "Canada Post", 100012: "Australia Post", 100016: "La Poste",
+}
+
+
+def track_package(tracking_number: str) -> dict:
+    tn_clean = re.sub(r"\s+", "", tracking_number).upper()
+    carrier  = _detect_carrier(tn_clean)
+
+    if carrier == "amazon_logistics":
+        return {
+            "tracking_number": tracking_number,
+            "detected_carrier": "Amazon Logistics",
+            "status": "Cannot track via this tool",
+            "note": (
+                "Amazon Logistics (TBA tracking numbers) can only be tracked at "
+                "amazon.com/orders. Standard carrier tracking is not available for these."
+            ),
+        }
+
+    try:
+        payload = json.dumps({"number": tn_clean}).encode()
+        req = urllib.request.Request(
+            "https://t.17track.net/restapi/track",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=12) as r:
+            resp = json.loads(r.read().decode())
+
+        if not resp.get("shipments"):
+            return {
+                "tracking_number": tracking_number,
+                "detected_carrier": carrier,
+                "status": "Not found",
+                "note": "No tracking information found. The package may not yet be in the system.",
+            }
+
+        shipment = resp["shipments"][0]
+        carrier_code    = shipment.get("carrier")
+        reported_carrier = _17TRACK_CARRIER_NAMES.get(carrier_code, f"Carrier #{carrier_code}")
+
+        track  = shipment.get("track", {})
+        w1     = track.get("w1", {})
+        latest = w1.get("z0", {})
+        history_raw = w1.get("z1", [])
+
+        status_code = latest.get("c", 10)
+        status = _17TRACK_STATUS_MAP.get(status_code, f"Status code {status_code}")
+
+        latest_event = {
+            "description": latest.get("b", latest.get("a", "")),
+            "location":    latest.get("e", ""),
+            "timestamp":   latest.get("d", ""),
+        }
+
+        history = [
+            {
+                "timestamp":   e.get("a", ""),
+                "description": e.get("b", ""),
+                "location":    e.get("c", ""),
+            }
+            for e in history_raw[:10]
+        ]
+
+        return {
+            "tracking_number":  tracking_number,
+            "detected_carrier": carrier,
+            "reported_carrier": reported_carrier,
+            "status":      status,
+            "status_code": status_code,
+            "latest_event": latest_event,
+            "history": history,
+        }
+
+    except urllib.error.URLError as e:
+        return {"tracking_number": tracking_number, "error": f"Network error: {str(e)}"}
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        return {"tracking_number": tracking_number, "error": f"Failed to parse tracking response: {str(e)}"}
+
+
 # ── Tool registry ─────────────────────────────────────────────────────────────
 
 TOOLS = {
@@ -1014,6 +1619,103 @@ TOOLS = {
         },
         "fn": lambda args: get_hardware_profile(args.get("use_case", "")),
     },
+    "set_reminder": {
+        "description": (
+            "Schedule a reminder that fires a macOS notification at the specified time. "
+            "Accepts natural-language time: 'in 2 hours', 'in 30 minutes', "
+            "'at 9:00 am', 'at 3pm', 'tomorrow at 8am'. "
+            "Returns a reminder ID that can be used with cancel_reminder."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The reminder text to display in the notification.",
+                },
+                "time": {
+                    "type": "string",
+                    "description": (
+                        "When to fire the reminder. Examples: 'in 2 hours', "
+                        "'in 30 minutes', 'at 9:00 am', 'at 3pm', 'tomorrow at 8am'."
+                    ),
+                },
+            },
+            "required": ["message", "time"],
+        },
+        "fn": lambda args: set_reminder(args["message"], args["time"]),
+    },
+    "list_reminders": {
+        "description": "List all pending (unfired) reminders with their IDs, messages, and scheduled fire times.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "fn": lambda _: list_reminders(),
+    },
+    "cancel_reminder": {
+        "description": "Cancel a pending reminder by its ID. Get the ID from set_reminder or list_reminders.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "The reminder ID to cancel (8-character hex string).",
+                }
+            },
+            "required": ["id"],
+        },
+        "fn": lambda args: cancel_reminder(args["id"]),
+    },
+    "get_weather": {
+        "description": (
+            "Returns current weather conditions and clothing suggestions. "
+            "Auto-detects location from IP if no location is provided. "
+            "Pass a city name for a specific location (e.g. 'Tokyo' or 'London, UK')."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "City name (e.g. 'Tokyo', 'London, UK'). Leave empty to auto-detect from IP.",
+                    "default": "",
+                },
+                "units": {
+                    "type": "string",
+                    "enum": ["imperial", "metric"],
+                    "description": "Temperature units: 'imperial' (°F, mph) or 'metric' (°C, km/h). Defaults to imperial.",
+                    "default": "imperial",
+                },
+            },
+            "required": [],
+        },
+        "fn": lambda args: get_weather(args.get("location", ""), args.get("units", "imperial")),
+    },
+    "check_app_updates": {
+        "description": (
+            "macOS only: checks for outdated applications via Homebrew (formulae + casks), "
+            "the Mac App Store (requires the 'mas' CLI — install with 'brew install mas'), "
+            "and macOS system software updates. Returns lists of outdated apps with current vs available versions."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "fn": lambda _: check_app_updates(),
+    },
+    "track_package": {
+        "description": (
+            "Track a package by tracking number. Auto-detects the carrier (UPS, USPS, FedEx, DHL). "
+            "Returns current status and recent tracking history. "
+            "Note: Amazon TBA numbers must be tracked at amazon.com/orders."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tracking_number": {
+                    "type": "string",
+                    "description": "The package tracking number (UPS, USPS, FedEx, or DHL).",
+                }
+            },
+            "required": ["tracking_number"],
+        },
+        "fn": lambda args: track_package(args["tracking_number"]),
+    },
 }
 
 
@@ -1097,4 +1799,6 @@ def main():
 
 
 if __name__ == "__main__":
+    _reminder_checker = ReminderChecker()
+    _reminder_checker.start()
     main()
